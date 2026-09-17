@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>IaT Team flow sensor interface</title>
+<style>
+  :root {
+    --bg:        #1a2440;
+    --panel:     #223056;
+    --accent:    #85BA85;   /* light bluish silver, mimic LundaLogger */
+    --value:     #7ee39a;
+    --unit:      #cfe0ff;
+    --grid:      #3a4a72;
+    --text:      #e8eefc;
+    --muted:     #97a6c8;
+    --error:     #d97a7a;
+  }
+  html, body { margin: 0; padding: 0; height: 100%; background: var(--bg); color: var(--text);
+               font-family: system-ui, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 12px 20px; background: var(--panel); font-weight: 600; font-size: 18px;
+           border-bottom: 1px solid var(--grid); display: flex; align-items: center; gap: 14px; }
+  header .title { flex: 1; }
+  header .status { font-size: 13px; color: var(--muted); font-weight: normal; }
+  main { display: flex; flex-direction: column; padding: 12px 20px; gap: 12px; height: calc(100% - 60px); box-sizing: border-box; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  .controls > * { font-size: 13px; }
+  button, input, select { background: var(--panel); color: var(--text); border: 1px solid var(--grid);
+                          padding: 6px 10px; border-radius: 4px; font-size: 13px; }
+  button { cursor: pointer; }
+  button:hover:not([disabled]) { background: #2b3b66; }
+  button[disabled] { opacity: 0.5; cursor: not-allowed; }
+  button.primary   { background: #3a67c8; border-color: #3a67c8; }
+  button.recording { background: #a63a3a; border-color: #a63a3a; }
+  label { color: var(--muted); }
+  input[type=number] { width: 70px; }
+  #plot { flex: 1; background: var(--panel); border-radius: 6px; border: 1px solid var(--grid); }
+  #big { font-size: 13px; color: var(--muted); display: flex; gap: 20px; }
+  #big span.value { color: var(--value); font-weight: 600; font-size: 18px; }
+  .warn { background: #402525; color: #ffbaba; padding: 8px 12px; border-radius: 4px; display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="title">IaT Team flow sensor interface</span>
+  <span class="status" id="status">disconnected</span>
+</header>
+
+<main>
+
+  <div id="unsupported" class="warn">
+    Your browser does not support the Web Serial API. Please use a Chromium-based browser
+    (Chrome, Edge, Opera, Brave). Firefox and Safari are not supported.
+  </div>
+
+  <div class="controls">
+    <button id="btnConnect" class="primary">Connect…</button>
+    <button id="btnDisconnect" disabled>Disconnect</button>
+
+    <label>Baud:
+      <select id="baud">
+        <option>9600</option>
+        <option>38400</option>
+        <option>57600</option>
+        <option selected>115200</option>
+        <option>230400</option>
+        <option>460800</option>
+        <option>921600</option>
+      </select>
+    </label>
+
+    <label>Rate [Hz]:
+      <input type="number" id="rateHz" min="1" max="500" step="1" value="20" disabled>
+    </label>
+    <button id="btnRate" disabled>Set</button>
+
+    <label>Window [s]:
+      <input type="number" id="win" min="1" max="600" step="1" value="30">
+    </label>
+
+    <span style="flex:1"></span>
+
+    <button id="btnRecord" disabled>Record CSV</button>
+    <button id="btnClear">Clear</button>
+  </div>
+
+  <div id="big">
+    <div>flow: <span class="value" id="lastFlow">–</span> slm Air</div>
+    <div>seq: <span id="lastSeq">–</span></div>
+    <div>samples: <span id="nSamples">0</span></div>
+  </div>
+
+  <canvas id="plot"></canvas>
+
+</main>
+
+<script>
+"use strict";
+
+// ---------- state ----------
+const state = {
+  port: null,
+  reader: null,
+  writer: null,
+  keepReading: false,
+  recording: false,
+  csvChunks: [],
+  csvName: null,
+  samples: [],           // {t: epoch_ms, seq, flow}
+  windowSec: 30,
+  rateHz: 20,
+};
+
+// ---------- DOM ----------
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status");
+const btnConnect = $("btnConnect");
+const btnDisconnect = $("btnDisconnect");
+const btnRate = $("btnRate");
+const btnRecord = $("btnRecord");
+const btnClear = $("btnClear");
+const winInput = $("win");
+const rateInput = $("rateHz");
+const baudSel = $("baud");
+const canvas = $("plot");
+const ctx = canvas.getContext("2d");
+
+// ---------- support check ----------
+if (!("serial" in navigator)) {
+  $("unsupported").style.display = "block";
+  btnConnect.disabled = true;
+}
+
+// ---------- helpers ----------
+function setStatus(text) { statusEl.textContent = text; }
+
+function updateButtons() {
+  const connected = !!state.port;
+  btnConnect.disabled = connected;
+  btnDisconnect.disabled = !connected;
+  rateInput.disabled = !connected;
+  btnRate.disabled = !connected;
+  btnRecord.disabled = state.samples.length === 0 && !state.recording && !connected;
+}
+
+// ---------- serial ----------
+async function connect() {
+  try {
+    state.port = await navigator.serial.requestPort();
+    const baud = parseInt(baudSel.value, 10) || 115200;
+    await state.port.open({ baudRate: baud });
+    setStatus(`connected @ ${baud}`);
+    state.keepReading = true;
+    state.writer = state.port.writable.getWriter();
+    updateButtons();
+    readLoop();       // fire and forget
+  } catch (err) {
+    setStatus("connect error: " + err.message);
+    state.port = null;
+    updateButtons();
+  }
+}
+
+async function disconnect() {
+  state.keepReading = false;
+  try { if (state.reader) { await state.reader.cancel(); } } catch(e) {}
+  try { if (state.writer) { state.writer.releaseLock(); } } catch(e) {}
+  try { if (state.port) { await state.port.close(); } } catch(e) {}
+  state.port = null;
+  state.reader = null;
+  state.writer = null;
+  setStatus("disconnected");
+  updateButtons();
+}
+
+async function sendCommand(cmd) {
+  if (!state.writer) return;
+  const bytes = new TextEncoder().encode(cmd + "\n");
+  try { await state.writer.write(bytes); } catch(e) { setStatus("write error: " + e.message); }
+}
+
+async function readLoop() {
+  const decoder = new TextDecoder();
+  let leftover = "";
+  const lineRe = /^#(\d+)\t(-?\d+(?:\.\d+)?)\s*$/;
+  try {
+    while (state.keepReading && state.port && state.port.readable) {
+      state.reader = state.port.readable.getReader();
+      try {
+        while (true) {
+          const { value, done } = await state.reader.read();
+          if (done) break;
+          leftover += decoder.decode(value, { stream: true });
+          let idx;
+          while ((idx = leftover.indexOf("\n")) >= 0) {
+            const line = leftover.slice(0, idx).trim();
+            leftover = leftover.slice(idx + 1);
+            if (!line) continue;
+            const m = lineRe.exec(line);
+            if (!m) continue;
+            const seq  = parseInt(m[1], 10);
+            const flow = parseFloat(m[2]);
+            const t    = Date.now();
+            state.samples.push({ t, seq, flow });
+            if (state.recording) {
+              const iso = new Date(t).toISOString();
+              state.csvChunks.push(`${iso},${(t/1000).toFixed(3)},${seq},${flow.toFixed(3)}\n`);
+            }
+            // trim old samples so buffer doesn't grow forever
+            const cutoff = t - Math.max(60, state.windowSec * 2) * 1000;
+            while (state.samples.length && state.samples[0].t < cutoff) state.samples.shift();
+          }
+        }
+      } finally {
+        state.reader.releaseLock();
+        state.reader = null;
+      }
+    }
+  } catch (err) {
+    setStatus("read error: " + err.message);
+  }
+}
+
+// ---------- CSV recording ----------
+function toggleRecord() {
+  if (state.recording) {
+    state.recording = false;
+    btnRecord.textContent = "Record CSV";
+    btnRecord.classList.remove("recording");
+    // build a blob and offer as download
+    const blob = new Blob(state.csvChunks, { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = state.csvName;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    state.csvChunks = [];
+    state.csvName = null;
+    setStatus("recording saved");
+  } else {
+    state.recording = true;
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    state.csvName = `flow_${stamp}.csv`;
+    state.csvChunks = [ "iso_time,epoch_s,seq,flow_slm\n" ];
+    btnRecord.textContent = "Stop & Save";
+    btnRecord.classList.add("recording");
+    setStatus("recording " + state.csvName);
+  }
+}
+
+// ---------- plot ----------
+function resizeCanvas() {
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  canvas.width  = Math.floor(w * dpr);
+  canvas.height = Math.floor(h * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener("resize", resizeCanvas);
+
+function draw() {
+  const w = canvas.clientWidth;
+  const h = canvas.clientHeight;
+  ctx.fillStyle = "#223056"; ctx.fillRect(0, 0, w, h);
+
+  const pad = { l: 60, r: 20, t: 15, b: 30 };
+  const pw = w - pad.l - pad.r;
+  const ph = h - pad.t - pad.b;
+
+  const now = Date.now();
+  const windowMs = state.windowSec * 1000;
+  const tmax = now;
+  const tmin = tmax - windowMs;
+
+  // filter samples in the visible window
+  const pts = state.samples.filter(s => s.t >= tmin);
+  let fmin = 0, fmax = 1;
+  if (pts.length) {
+    fmin =  Infinity; fmax = -Infinity;
+    for (const p of pts) { if (p.flow < fmin) fmin = p.flow; if (p.flow > fmax) fmax = p.flow; }
+    if (fmin === fmax) { fmin -= 0.5; fmax += 0.5; }
+    const yPad = 0.1 * (fmax - fmin);
+    fmin -= yPad; fmax += yPad;
+  }
+
+  // grid
+  ctx.strokeStyle = "#3a4a72"; ctx.lineWidth = 1; ctx.font = "12px system-ui,Segoe UI,sans-serif";
+  ctx.fillStyle = "#97a6c8";
+  ctx.textAlign = "right"; ctx.textBaseline = "middle";
+  const yTicks = 5;
+  for (let i = 0; i <= yTicks; ++i) {
+    const y = pad.t + ph * (i / yTicks);
+    const v = fmax - (fmax - fmin) * (i / yTicks);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(pad.l + pw, y); ctx.stroke();
+    ctx.fillText(v.toFixed(2), pad.l - 6, y);
+  }
+  ctx.textAlign = "center"; ctx.textBaseline = "top";
+  const xTicks = 6;
+  for (let i = 0; i <= xTicks; ++i) {
+    const x = pad.l + pw * (i / xTicks);
+    const sec = -state.windowSec + state.windowSec * (i / xTicks);
+    ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, pad.t + ph); ctx.stroke();
+    ctx.fillText(sec.toFixed(0) + " s", x, pad.t + ph + 4);
+  }
+
+  // axis labels
+  ctx.fillStyle = "#cfe0ff"; ctx.textAlign = "left"; ctx.textBaseline = "top";
+  ctx.fillText("flow [slm Air]", pad.l + 4, pad.t + 4);
+
+  // trace
+  if (pts.length >= 2) {
+    ctx.strokeStyle = "#7ee39a"; ctx.lineWidth = 1.5; ctx.beginPath();
+    for (let i = 0; i < pts.length; ++i) {
+      const p = pts[i];
+      const x = pad.l + pw * (p.t - tmin) / windowMs;
+      const y = pad.t + ph * (fmax - p.flow) / (fmax - fmin);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  }
+
+  // last-value readout
+  if (pts.length) {
+    const last = pts[pts.length - 1];
+    $("lastFlow").textContent = last.flow.toFixed(3);
+    $("lastSeq").textContent  = last.seq;
+  }
+  $("nSamples").textContent = pts.length;
+}
+
+function tick() {
+  state.windowSec = Math.max(1, Math.min(600, parseInt(winInput.value, 10) || 30));
+  draw();
+  requestAnimationFrame(tick);
+}
+
+// ---------- wiring ----------
+btnConnect.addEventListener("click", connect);
+btnDisconnect.addEventListener("click", disconnect);
+btnClear.addEventListener("click", () => { state.samples = []; });
+btnRecord.addEventListener("click", toggleRecord);
+btnRate.addEventListener("click", () => {
+  const hz = Math.max(1, Math.min(500, parseInt(rateInput.value, 10) || 20));
+  state.rateHz = hz;
+  const ms = Math.max(1, Math.round(1000 / hz));
+  sendCommand("R" + ms);
+});
+rateInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") btnRate.click(); });
+
+window.addEventListener("beforeunload", () => { if (state.port) disconnect(); });
+
+// enable Record even without port so old buffer can be saved
+btnRecord.disabled = false;
+
+resizeCanvas();
+requestAnimationFrame(tick);
+</script>
+
+</body>
+</html>
