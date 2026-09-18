@@ -231,7 +231,9 @@ async function readLoop() {
             state.samples.push({ t, seq, flow, filteredFlow });
             if (state.recording) {
               const iso = new Date(t).toISOString();
-              state.csvChunks.push(`${iso},${(t/1000).toFixed(3)},${seq},${flow.toFixed(3)}\n`);
+              state.csvChunks.push(
+                `${iso},${(t/1000).toFixed(3)},${seq},${flow.toFixed(3)},${filteredFlow.toFixed(3)}\n`
+              );
             }
             // trim old samples so buffer doesn't grow forever
             const cutoff = t - Math.max(60, state.windowSec * 2) * 1000;
@@ -269,7 +271,7 @@ function toggleRecord() {
     state.recording = true;
     const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     state.csvName = `flow_${stamp}.csv`;
-    state.csvChunks = [ "iso_time,epoch_s,seq,flow_slm\n" ];
+    state.csvChunks = [ "iso_time,epoch_s,seq,flow_slm,filtered_flow_slm\n" ];
     btnRecord.textContent = "Stop & Save";
     btnRecord.classList.add("recording");
     setStatus("recording " + state.csvName);
