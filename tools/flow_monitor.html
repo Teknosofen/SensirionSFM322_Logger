@@ -78,6 +78,10 @@
       <input type="number" id="win" min="1" max="600" step="1" value="30">
     </label>
 
+    <label>Forgetting factor:
+      <input type="number" id="forgettingFactor" min="0" max="1" step="0.001" value="0.900">
+    </label>
+
     <span style="flex:1"></span>
 
     <button id="btnRecord" disabled>Record CSV</button>
@@ -109,6 +113,7 @@ const state = {
   samples: [],           // {t: epoch_ms, seq, flow}
   windowSec: 30,
   rateHz: 20,
+  forgettingFactor: 0.9,
 };
 
 // ---------- DOM ----------
@@ -120,6 +125,7 @@ const btnRate = $("btnRate");
 const btnRecord = $("btnRecord");
 const btnClear = $("btnClear");
 const winInput = $("win");
+const forgettingFactorInput = $("forgettingFactor");
 const rateInput = $("rateHz");
 const baudSel = $("baud");
 const canvas = $("plot");
@@ -133,6 +139,23 @@ if (!("serial" in navigator)) {
 
 // ---------- helpers ----------
 function setStatus(text) { statusEl.textContent = text; }
+
+function recomputeFilteredSamples() {
+  let filtered = null;
+  for (const sample of state.samples) {
+    filtered = filtered === null
+      ? sample.flow
+      : state.forgettingFactor * filtered + (1 - state.forgettingFactor) * sample.flow;
+    sample.filteredFlow = filtered;
+  }
+}
+
+function updateForgettingFactor() {
+  const value = Number.parseFloat(forgettingFactorInput.value);
+  state.forgettingFactor = Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 0.9;
+  forgettingFactorInput.value = state.forgettingFactor.toFixed(3);
+  recomputeFilteredSamples();
+}
 
 function updateButtons() {
   const connected = !!state.port;
@@ -201,7 +224,11 @@ async function readLoop() {
             const seq  = parseInt(m[1], 10);
             const flow = parseFloat(m[2]);
             const t    = Date.now();
-            state.samples.push({ t, seq, flow });
+            const previous = state.samples[state.samples.length - 1];
+            const filteredFlow = previous
+              ? state.forgettingFactor * previous.filteredFlow + (1 - state.forgettingFactor) * flow
+              : flow;
+            state.samples.push({ t, seq, flow, filteredFlow });
             if (state.recording) {
               const iso = new Date(t).toISOString();
               state.csvChunks.push(`${iso},${(t/1000).toFixed(3)},${seq},${flow.toFixed(3)}\n`);
@@ -309,7 +336,7 @@ function draw() {
   ctx.fillStyle = "#cfe0ff"; ctx.textAlign = "left"; ctx.textBaseline = "top";
   ctx.fillText("flow [slm Air]", pad.l + 4, pad.t + 4);
 
-  // trace
+  // Unfiltered trace.
   if (pts.length >= 2) {
     ctx.strokeStyle = "#7ee39a"; ctx.lineWidth = 1.5; ctx.beginPath();
     for (let i = 0; i < pts.length; ++i) {
@@ -319,7 +346,23 @@ function draw() {
       if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
     }
     ctx.stroke();
+
+    // Draw the filtered trace last so it remains visible over the raw signal.
+    ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 2; ctx.beginPath();
+    for (let i = 0; i < pts.length; ++i) {
+      const p = pts[i];
+      const x = pad.l + pw * (p.t - tmin) / windowMs;
+      const y = pad.t + ph * (fmax - p.filteredFlow) / (fmax - fmin);
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
   }
+
+  // legend
+  ctx.font = "12px system-ui,Segoe UI,sans-serif";
+  ctx.textAlign = "right"; ctx.textBaseline = "top";
+  ctx.fillStyle = "#7ee39a"; ctx.fillText("unfiltered", pad.l + pw - 62, pad.t + 4);
+  ctx.fillStyle = "#ffffff"; ctx.fillText("filtered", pad.l + pw, pad.t + 4);
 
   // last-value readout
   if (pts.length) {
@@ -348,6 +391,13 @@ btnRate.addEventListener("click", () => {
   sendCommand("R" + ms);
 });
 rateInput.addEventListener("keydown", (ev) => { if (ev.key === "Enter") btnRate.click(); });
+forgettingFactorInput.addEventListener("change", updateForgettingFactor);
+forgettingFactorInput.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") {
+    updateForgettingFactor();
+    forgettingFactorInput.blur();
+  }
+});
 
 window.addEventListener("beforeunload", () => { if (state.port) disconnect(); });
 
